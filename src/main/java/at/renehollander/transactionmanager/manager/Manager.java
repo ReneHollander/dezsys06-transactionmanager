@@ -3,13 +3,17 @@ package at.renehollander.transactionmanager.manager;
 import at.renehollander.transactionmanager.Callback;
 import at.renehollander.transactionmanager.Maps;
 import com.corundumstudio.socketio.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.sql.SQLException;
 import java.util.*;
-import java.util.concurrent.TimeoutException;
-import java.util.stream.Collectors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class Manager implements AuthorizationListener {
+
+    private static Logger LOG = LoggerFactory.getLogger(Manager.class);
 
     private Map<String, SocketIOClient> clients;
     private SocketIOServer server;
@@ -34,102 +38,138 @@ public class Manager implements AuthorizationListener {
         String name = client.getHandshakeData().getUrlParams().get("name").get(0);
         client.set("name", name);
         clients.put(name, client);
-        System.out.println("Client " + name + " connected!");
+        LOG.info("Client " + name + " connected!");
     }
 
-    public void execute(int timeout, String statement, Callback.NoParamsWithError callback) {
+    public void execute(int timeout, String statement, Callback.NoParamsWithStringError callback) {
+        Lock lock = new ReentrantLock();
         Set<SocketIOClient> clients = fetch();
-        List<Exception> exceptions = new ArrayList<>();
+        List<String> exceptions = new ArrayList<>();
+        AtomicBoolean triggered = new AtomicBoolean(false);
         server.getBroadcastOperations().sendEvent("execute", Maps.of("timeout", timeout, "statement", statement), new BroadcastAckCallback<Map>(Map.class, timeout) {
             public void onClientSuccess(SocketIOClient client, Map resultMap) {
+                lock.lock();
+                LOG.info("Recieved response from " + client.get("name"));
                 Map<String, Object> result = resultMap;
                 if (result == null) result = new HashMap<>();
                 clients.remove(client);
                 if (result.containsKey("error")) {
-                    exceptions.add(new SQLException("client " + client.get("name") + " responded with an exception: " + (String) result.get("error")));
+                    LOG.error("client " + client.get("name") + " responded with an exception: " + result.get("error"));
+                    exceptions.add("client " + client.get("name") + " responded with an exception: " + result.get("error"));
+                } else {
+                    LOG.info("client " + client.get("name") + " response after " + statement + " was ok");
                 }
-                rollbackOrCommitCheck(clients, exceptions, timeout, callback);
+                rollbackOrCommitCheck(clients, exceptions, timeout, callback, triggered);
+                lock.unlock();
             }
 
             public void onClientTimeout(SocketIOClient client) {
+                lock.lock();
                 clients.remove(client);
-                exceptions.add(new TimeoutException("client " + client.get("name") + " timed out"));
-                rollbackOrCommitCheck(clients, exceptions, timeout, callback);
+                LOG.error("client " + client.get("name") + " timed out");
+                exceptions.add("client " + client.get("name") + " timed out");
+                rollbackOrCommitCheck(clients, exceptions, timeout, callback, triggered);
+                lock.unlock();
             }
+        });
+        clients.forEach((client) -> {
+            LOG.info("Sent Statement \"" + statement + "\" to " + client.get("name"));
         });
     }
 
-    private void rollbackOrCommitCheck(Set<SocketIOClient> clients, List<Exception> exceptions, int timeout, Callback.NoParamsWithError callback) {
-        if (clients.isEmpty()) {
+    private synchronized void rollbackOrCommitCheck(Set<SocketIOClient> clients, List<String> exceptions, int timeout, Callback.NoParamsWithStringError callback, AtomicBoolean triggered) {
+        if (!triggered.get() && clients.isEmpty()) {
+            triggered.set(true);
             if (!exceptions.isEmpty()) {
-                rollback(timeout, callback);
+                LOG.info("Executing Rollback on all stations");
+                rollback(timeout, callback, exceptions);
             } else if (exceptions.isEmpty()) {
-                commit(timeout, callback);
+                LOG.info("Executing Commit on all stations");
+                commit(timeout, callback, exceptions);
             }
         }
     }
 
-    private void callbackCheck(Set<SocketIOClient> clients, List<Exception> exceptions, Callback.NoParamsWithError callback) {
-        if (clients.isEmpty()) {
+    private synchronized void callbackCheck(Set<SocketIOClient> clients, List<String> exceptions, Callback.NoParamsWithStringError callback, AtomicBoolean triggered, List<String> prev) {
+        if (!triggered.get() && clients.isEmpty()) {
+            triggered.set(true);
             if (exceptions.isEmpty()) {
-                callback.execute(new SQLException("we needed to roll back!"));
+                callback.execute(prev.isEmpty() ? null : prev.toArray(new String[prev.size()]));
             } else if (!exceptions.isEmpty()) {
-                callback.execute(squash(exceptions));
+                List<String> all = new ArrayList<>(exceptions);
+                all.addAll(prev);
+                callback.execute(all.toArray(new String[all.size()]));
             }
         }
     }
 
-    private Exception squash(List<Exception> exceptions) {
-        return new Exception(exceptions.stream().map(Throwable::getMessage).collect(Collectors.joining(", ")));
-    }
-
-    private void rollback(int timeout, Callback.NoParamsWithError callback) {
+    private void rollback(int timeout, Callback.NoParamsWithStringError callback, List<String> prev) {
+        Lock lock = new ReentrantLock();
         Set<SocketIOClient> clients = fetch();
-        List<Exception> exceptions = new ArrayList<>();
+        List<String> exceptions = new ArrayList<>();
+        AtomicBoolean triggered = new AtomicBoolean(false);
         server.getBroadcastOperations().sendEvent("rollback", null, new BroadcastAckCallback<Map>(Map.class, timeout) {
             public void onClientSuccess(SocketIOClient client, Map resultMap) {
+                lock.lock();
                 Map<String, Object> result = resultMap;
                 if (result == null) result = new HashMap<>();
                 clients.remove(client);
                 if (result.containsKey("error")) {
-                    exceptions.add(new SQLException("client " + client.get("name") + " responded with an exception while rolling back: " + result.get("error")));
+                    LOG.error("client " + client.get("name") + " responded with an exception while rolling back: " + result.get("error"));
+                    exceptions.add("client " + client.get("name") + " responded with an exception while rolling back: " + result.get("error"));
+                } else {
+                    LOG.info("client " + client.get("name") + " response after rollback was ok");
                 }
-                callbackCheck(clients, exceptions, callback);
+                callbackCheck(clients, exceptions, callback, triggered, prev);
+                lock.unlock();
             }
 
             public void onClientTimeout(SocketIOClient client) {
+                lock.lock();
                 clients.remove(client);
-                exceptions.add(new TimeoutException("client " + client.get("name") + " timed out while rolling back"));
-                callbackCheck(clients, exceptions, callback);
+                exceptions.add("client " + client.get("name") + " timed out while rolling back");
+                LOG.error("client " + client.get("name") + " timed out while rolling back");
+                callbackCheck(clients, exceptions, callback, triggered, prev);
+                lock.unlock();
             }
         });
     }
 
-    private void commit(int timeout, Callback.NoParamsWithError callback) {
+    private void commit(int timeout, Callback.NoParamsWithStringError callback, List<String> prev) {
+        Lock lock = new ReentrantLock();
         Set<SocketIOClient> clients = fetch();
-        List<Exception> exceptions = new ArrayList<>();
+        List<String> exceptions = new ArrayList<>();
+        AtomicBoolean triggered = new AtomicBoolean(false);
         server.getBroadcastOperations().sendEvent("commit", null, new BroadcastAckCallback<Map>(Map.class, timeout) {
             public void onClientSuccess(SocketIOClient client, Map resultMap) {
+                lock.lock();
                 Map<String, Object> result = resultMap;
                 if (result == null) result = new HashMap<>();
                 clients.remove(client);
                 if (result.containsKey("error")) {
-                    exceptions.add(new SQLException("client " + client.get("name") + " responded with an exception while committing: " + result.get("error")));
+                    exceptions.add("client " + client.get("name") + " responded with an exception while committing: " + result.get("error"));
+                    LOG.error("client " + client.get("name") + " responded with an exception while committing: " + result.get("error"));
+                } else {
+                    LOG.info("client " + client.get("name") + " response after commit was ok");
                 }
-                callbackCheck(clients, exceptions, callback);
+                callbackCheck(clients, exceptions, callback, triggered, prev);
+                lock.unlock();
             }
 
             public void onClientTimeout(SocketIOClient client) {
+                lock.lock();
                 clients.remove(client);
-                exceptions.add(new TimeoutException("client " + client.get("name") + " timed out while committing"));
-                callbackCheck(clients, exceptions, callback);
+                exceptions.add("client " + client.get("name") + " timed out while committing");
+                LOG.error("client " + client.get("name") + " timed out while committing");
+                callbackCheck(clients, exceptions, callback, triggered, prev);
+                lock.unlock();
             }
         });
     }
 
     public void onDisconnect(SocketIOClient client) {
         clients.remove(client.get("name"));
-        System.out.println("Client " + client.get("name") + " disconnected!");
+        LOG.info("Client " + client.get("name") + " disconnected!");
     }
 
     public boolean isAuthorized(HandshakeData data) {

@@ -6,13 +6,15 @@ import io.socket.client.IO;
 import io.socket.client.Socket;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.net.URISyntaxException;
 import java.sql.SQLException;
-import java.util.Arrays;
 
 public class Station {
+    private static Logger LOG = LoggerFactory.getLogger(Station.class);
 
     private String name;
 
@@ -30,9 +32,15 @@ public class Station {
         }
 
         try {
+            LOG.info("Connecting to manager " + hostname + ":" + port);
             IO.Options opts = new IO.Options();
             opts.query = "name=" + getName();
             socket = IO.socket("http://" + hostname + ":" + port, opts);
+
+            socket.on(Socket.EVENT_CONNECT, (args) -> LOG.info("Connected to manager"));
+            socket.on(Socket.EVENT_CONNECT_ERROR, (args) -> LOG.info("Error connecting to manager"));
+            socket.on(Socket.EVENT_CONNECT_TIMEOUT, (args) -> LOG.info("Connection Timed out"));
+            socket.on(Socket.EVENT_DISCONNECT, (args) -> LOG.info("Disconnected from manager"));
 
             socket.on("execute", this::onExecute);
             socket.on("commit", this::onCommit);
@@ -45,7 +53,7 @@ public class Station {
     }
 
     private void onCommit(Object[] datas) {
-        System.out.println(Arrays.toString(datas));
+        LOG.info("Recieved commit from Transaction Manager");
         Ack ack = (Ack) datas[datas.length - 1];
         getDatabaseConnection().commit((err) -> {
             if (err != null) {
@@ -57,6 +65,7 @@ public class Station {
     }
 
     private void onRollback(Object[] datas) {
+        LOG.info("Recieved rollback from Transaction Manager");
         Ack ack = (Ack) datas[datas.length - 1];
         getDatabaseConnection().rollback((err) -> {
             if (err != null) {
@@ -72,6 +81,7 @@ public class Station {
     }
 
     public void onExecute(Object... datas) {
+        LOG.info("Recieved statement from Transaction Manager");
         Ack ack = (Ack) datas[datas.length - 1];
         JSONObject data = (JSONObject) datas[0];
         try {
@@ -83,6 +93,7 @@ public class Station {
                 }
             });
         } catch (JSONException e) {
+            LOG.error("An exception occured while parsing request", e);
             ack.call(Maps.of("error", e.getMessage()));
         }
     }

@@ -12,6 +12,15 @@ public final class Callback {
     }
 
     @FunctionalInterface
+    public interface NoParamsWithStringError {
+        void execute(String[] err);
+
+        default void execute() {
+            execute(null);
+        }
+    }
+
+    @FunctionalInterface
     public interface OneParamWithError<T> {
 
         void execute(Exception err, T t);
